@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+
+export version=0.0.0 IPFS_PATH="${IPFS_PATH:="${HOME}"/.ipfs}"
+
+usage(){
+  echo -e '\nBrief: Announce dynamic multiaddress of isolated or private node through IPNS or get multiaddress to such a node'
+  echo -e '\nUsage: ipfs-link [option] [<peerID>]
+  Provide peerID only when seeking multiaddress (or swarm key) to the corresponding node'
+  echo -e "\nOption: 
+  -k hash | rand
+    For swarm key generation.
+    $(tput smul)hash$(tput rmul) implies key derived from peerID. $(tput smul)rand$(tput rmul) implies random key.
+  -c IPFS_PATH
+    Pass path to local IPFS repository. Can also use IPFS_PATH env variable instead.
+  -v
+    Version
+  -h
+    Show help"
+  echo -e '\nExamples & Details: https://github.com/SomajitDey/ipfs-link'
+  exit
+} >&2; export -f usage
+
+keygen(){
+  # Brief: Generate swarm key on stdout according to keygen_mode
+  local peerID="${1:-"${main_node_ID}"}"
+  echo -e "/key/swarm/psk/1.0.0/\n/base16/"
+  case "${keygen_mode}" in
+    'rand') echo "$(head -c32 /dev/urandom | xxd -p -c32)";;
+    'hash') echo "$(echo -n "${peerID}" | sha256sum | head -c64)";;
+  esac
+}; export -f keygen
+
+parse_cmdline(){
+  local OPTIND=1 opt
+  while getopts hvc:k: opt; do
+    case "${opt}" in
+      v) echo "${version}"; exit;;
+      c) export IPFS_PATH="${OPTARG}";;
+      k) [[ "${OPTARG}" =~ ^(rand|hash)$ ]] || usage; export keygen_mode="${OPTARG}";;
+      h|*) usage;;
+    esac
+  done
+  local serverID="${!OPTIND}"
+  if [[ -n "${serverID}" ]]; then
+    if [[ -v keygen_mode ]]; then
+      keygen "${serverID}"; exit
+    else
+      # Ref: https://ipfs.github.io/public-gateway-checker/
+      curl -sf https://ipfs.io/ipns/"${serverID}" 2>/dev/null || \
+      curl -sf https://gateway.ipfs.io/ipns/"${serverID}" 2>/dev/null || \
+      curl -sf https://cloudfare-ipfs.com/ipns/"${serverID}" 2>/dev/null || \
+      curl -sf https://gateway.pinata.cloud/ipns/"${serverID}" 2>/dev/null || \
+      curl -sf https://hub.textile.io/ipns/"${serverID}" 2>/dev/null || \
+      curl -sf https://ipfs.fleek.co/ipns/"${serverID}" 2>/dev/null
+      exit "${?}"
+    fi
+  fi
+}; export -f parse_cmdline
+
+parse_cmdline "${@}"
+
+main_node_config(){
+  # Brief: Config the isolated / private node if not already online
+  export main_node_ID="$(ipfs id -f='<id>')"
+  ipfs swarm peers && return 0
+  [[ -v keygen_mode ]] && keygen > "${IPFS_PATH}"/swarm.key
+  if [[ -f "${IPFS_PATH}"/swarm.key ]]; then # Remove default bootstrap nodes in presence of swarm key
+    local curr_bootstrap="$(ipfs bootstrap list)"
+    local default_bootstrap="$(ipfs bootstrap rm all; ipfs bootstrap add default; ipfs bootstrap list)"
+    local pnet_boostrap="$(echo "${curr_bootstrap}" | grep -vf <(echo "${default_bootstrap}"))"
+    ipfs bootstrap rm all; echo "${pnet_boostrap}" | ipfs bootstrap add
+  else
+    ipfs bootstrap add default
+    local daemon_opts=(--routing=none) # Don't touch the config file
+  fi
+  local daemon_opts+=(--enable-pubsub-experiment --enable-namesys-pubsub --enable-gc)
+  [[ "$(ipfs daemon "${daemon_opts[@]}" | grep -iom1 'Daemon is ready' & tail -f --pid=$! /dev/null)" ]]
+} &>/dev/null; export main_node_config
+
+if main_node_config; then
+  echo -e "Status: Node is online\nID: ${main_node_ID}\nRepo: ${IPFS_PATH}"
+  [[ -f "${IPFS_PATH}"/swarm.key ]] && echo -e "Swarm key file: ${IPFS_PATH}/swarm.key\n" || echo
+  [[ "$(ipfs name pubsub state)" == enabled ]] || \
+    { echo "Error: IPNS over pubsub not enabled. Run your ipfs daemon with --enable-namesys-pubsub"; exit 1;}
+else
+  echo "Error: Failed to launch IPFS daemon. Exiting..."; exit 1
+fi >&2
+
+aux_node_config(){
+  # Brief: Config the auxilliary node that reprovides the IPNS records of the main node at reg intervals
+  export aux_IPFS_PATH="${HOME}"/.ipfs-link
+  ( # Subshell provides isolation from main environment so that we can export IPFS_PATH
+    export IPFS_PATH="${aux_IPFS_PATH}"
+    if ! ipfs id; then
+      ipfs init --profile server # Disallow local discovery & private IPs
+      ipfs config --bool Swarm.EnableRelayHop false
+      ipfs config Swarm.ConnMgr.Type none # Because this node stays online for seconds only
+      # NAT-traversal, if needed
+      ipfs config --bool Swarm.DisableNatPortMap false
+      ipfs config --bool Swarm.Transports.Network.Relay true
+      ipfs config --bool Swarm.EnableAutoRelay true
+      mkdir "${aux_IPFS_PATH}/ipns-records"
+    fi
+  )
+} &>/dev/null; export -f aux_node_config
+
+aux_node_config
+
+launch_aux_node(){
+  # Brief: Get aux node online, if not already running
+  # Note: Random ports necessary for multiple nodes (main + aux) to coexist on same machine
+  ipfs -c "${aux_IPFS_PATH}" swarm peers || \
+  ( export IPFS_PATH="${aux_IPFS_PATH}"
+    ipfs config profile apply randomports
+    pscan(){
+      # Brief: Give an unused, random, local TCP port except the one passed as argument
+      local port except="${1}"
+      while port="$(( 0x"$(dd if=/dev/urandom bs=2 count=1 2> /dev/null | xxd -p)" - 1 ))";do # Max port number=2^16-1
+        ((port!=except)) || continue
+        nc -z localhost "${port}" || break
+      done
+      echo "${port}"
+    } 2>/dev/null; export -f pscan
+    local API_port="$(pscan)"; ipfs config Addresses.API "/ip4/127.0.0.1/tcp/${API_port}"
+    local gateway_port="$(pscan "${API_port}")"; ipfs config Addresses.Gateway "/ip4/127.0.0.1/tcp/${gateway_port}"
+    [[ "$(ipfs daemon --enable-namesys-pubsub | grep -iom1 'Daemon is ready' & tail -f --pid=$! /dev/null)" ]]
+  )
+} &>/dev/null; export -f launch_aux_node
+
+timestamp(){
+  date +%D\ %H:%M:%S
+}; export -f timestamp
+
+main(){
+  # Brief: The main loop
+  trap "rm -f ${aux_IPFS_PATH}/ipns-records/${main_node_ID}" return
+  local buffer="$(mktemp)" multiaddress
+  while ipfs swarm peers &>/dev/null; do
+    # Choose only internet accessible multiaddress, including p2p-circuit, if any
+    until multiaddress="$(ipfs id -f="<addrs>\n" | grep -vf <(ipfs diag sys | jq -r .net.interface_addresses[]))"; do
+      echo -en "$(timestamp): Seeking public multiaddress - circuit-relay or public IP...\r"
+      sleep 1
+    done && echo
+
+    until launch_aux_node; do
+      echo -ne "$(timestamp): Failed to start aux node. Trying again in 2s...\r"
+    done && echo -e "\n\n$(timestamp): Aux node resumed"
+
+    local cid="$(echo "${multiaddress}" | ipfs add --pin=false --inline --inline-limit=1000 -Q)"
+    if [[ "${cid}" != "${last_cid}" ]]; then # No need to expire old IPNS records & create same but new ones unnecessarily
+      ipfs name publish --ipns-base=b58mh -Q /ipfs/"${cid}" &>/dev/null
+      ipfs dht get /ipns/"${main_node_ID}" > "${buffer}" && \
+        mv "${buffer}" "${aux_IPFS_PATH}"/ipns-records/"${main_node_ID}"
+      local last_cid="${cid}"
+    fi
+    
+    ( if flock -n 3; then
+        local records=("${aux_IPFS_PATH}"/ipns-records/*)
+        # To publish all records, bcoz why not, the other instances might be sleeping now
+      else # Another instance running
+        local records=("${aux_IPFS_PATH}"/ipns-records/"${main_node_ID}") # To publish only main node record
+        flock 3 # Wait for the other instance to finish
+        [[ "$(ipfs name resolve /ipns/"${main_node_ID}")" != /ipfs/"${cid}" ]] || exit
+        # The other instance has already published seconds ago. So no need to republish just now.
+      fi
+      export IPFS_PATH="${aux_IPFS_PATH}"
+      echo "${records[@]}" | xargs -n1 -P2 ipfs dht put /ipns/"${main_node_ID}" # Use max 2 threads
+    ) 3< "${aux_IPFS_PATH}"/config &>/dev/null
+     
+    flock -F -n "${aux_IPFS_PATH}/config" ipfs -c "${aux_IPFS_PATH}" shutdown &>/dev/null
+    echo -e "\n$(timestamp): Published multiaddress over IPNS. Aux node pausing for 15m..."; sleep 15m
+  done
+} >&2; export -f main
+
+main
