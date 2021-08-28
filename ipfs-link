@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Info: See `usage` funtion below
 
-export version=0.0.1 IPFS_PATH="${IPFS_PATH:="${HOME}"/.ipfs}"
+export version=0.0.2 IPFS_PATH="${IPFS_PATH:="${HOME}"/.ipfs}"
 
 usage(){
   echo -e '\nBrief: Announce dynamic multiaddress of isolated or private node through IPNS or get multiaddress to such a node'
@@ -127,6 +127,7 @@ launch_aux_node(){
   ipfs -c "${aux_IPFS_PATH}" swarm peers || \
   ( export IPFS_PATH="${aux_IPFS_PATH}"
     ipfs config profile apply randomports
+    rm -f "${IPFS_PATH}/config-pre-"*
     pscan(){
       # Brief: Give an unused, random, local TCP port except the one passed as argument
       local port except="${1}"
@@ -148,8 +149,8 @@ timestamp(){
 
 main(){
   # Brief: The main loop
-  trap "rm -f ${aux_IPFS_PATH}/ipns-records/${main_node_ID}" return
   local buffer="$(mktemp)" multiaddress
+  trap "rm -f ${aux_IPFS_PATH}/ipns-records/${main_node_ID} ${buffer}" return
   while ipfs swarm peers &>/dev/null; do
     # Choose only internet accessible multiaddress, including p2p-circuit, if any
     until multiaddress="$(ipfs id -f="<addrs>\n" | grep -vf <(ipfs diag sys | jq -r .net.interface_addresses[]))"; do
