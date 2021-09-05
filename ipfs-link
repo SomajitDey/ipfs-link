@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # Info: See `usage` funtion below
 
-export version=0.0.2 IPFS_PATH="${IPFS_PATH:="${HOME}"/.ipfs}"
+export version=0.1.0 IPFS_PATH="${IPFS_PATH:="${HOME}"/.ipfs}"
 
 usage(){
-  echo -e '\nBrief: Announce dynamic multiaddress of isolated or private node through IPNS or get multiaddress to such a node'
-  echo -e '\nUsage: ipfs-link [option] [<peerID>]
-  Provide peerID only when seeking multiaddress (or swarm key) to the corresponding node'
+  echo -e '\nBrief: 
+  1. Announce dynamic multiaddress of isolated or private node through IPNS
+  2. Get multiaddress to such a node
+  3. Expose http server running at localhost:<port>'
+  echo -e '\nUsage: ipfs-link [option] [<peerID> | <port>]
+  Provide peerID only when seeking multiaddress (or swarm key) to the corresponding node
+  Provide local TCP port number when exposing http server running at that port'
   echo -e "\nOption: 
   -k hash | rand
     For swarm key generation.
@@ -23,7 +27,15 @@ usage(){
 
 dep_check(){
   # Brief: Check major dependencies
-  local quit
+  local ipfs_version quit
+  if ipfs_version=$(ipfs version --number 2>/dev/null); then
+    local req_ipfs_ver=0.9.0 # Minimum ipfs-cli version required
+    [[ "$(echo -e "${ipfs_version}\n${req_ipfs_ver}" | sort -V | head -n1)" == "${req_ipfs_ver}" ]] || \
+      { echo -e "Required: go-ipfs-cli version >= ${req_ipfs_ver}\nSuggestion: ipfs update install latest\n"; quit="yes";}
+  else
+    echo -e "Required: go-ipfs-cli\nSource: https://docs.ipfs.io/install/command-line/#linux\n"
+    quit="yes"
+  fi
   if ! command -v jq &>/dev/null; then
     echo -e "Required: jq\nSource: Native package repository"
     echo -e "Ref: https://stedolan.github.io/jq/download/\n"
@@ -55,7 +67,8 @@ parse_cmdline(){
     esac
   done
   local serverID="${!OPTIND}"
-  if [[ -n "${serverID}" ]]; then
+  export expose_port="$(grep -x '[[:digit:]]*' <<< "${serverID}")"
+  if [[ -n "${serverID}" ]] && [[ -z "${expose_port}" ]]; then
     if [[ -v keygen_mode ]]; then
       keygen "${serverID}"; exit
     else
@@ -81,22 +94,34 @@ main_node_config(){
     local curr_bootstrap="$(ipfs bootstrap list)"
     local default_bootstrap="$(ipfs bootstrap rm all; ipfs bootstrap add default; ipfs bootstrap list)"
     local pnet_boostrap="$(echo "${curr_bootstrap}" | grep -vf <(echo "${default_bootstrap}"))"
-    ipfs bootstrap rm all; echo "${pnet_boostrap}" | ipfs bootstrap add
+    ipfs bootstrap rm all; ipfs bootstrap add <<< "${pnet_boostrap}"
   else
     ipfs bootstrap add default
     local daemon_opts=(--routing=none) # Don't touch the config file
   fi
   local daemon_opts+=(--enable-pubsub-experiment --enable-namesys-pubsub --enable-gc)
+  [[ -n expose_port ]] && ipfs config --json Experimental.Libp2pStreamMounting true
   [[ "$(ipfs daemon "${daemon_opts[@]}" | grep -iom1 'Daemon is ready' & tail -f --pid=$! /dev/null)" ]]
 } &>/dev/null; export main_node_config
 
 export main_node_ID="$(ipfs id -f='<id>')"
-echo -e "Status: Getting node online...\nID: ${main_node_ID}\nRepo: ${IPFS_PATH}"
+echo -e "Status: Getting node online...\nID: ${main_node_ID}\nRepo: ${IPFS_PATH}" >&2
 if main_node_config; then
   echo -e "Status: Node is online"
   [[ -f "${IPFS_PATH}"/swarm.key ]] && echo -e "Swarm key file: ${IPFS_PATH}/swarm.key\n" || echo
   [[ "$(ipfs name pubsub state)" == enabled ]] || \
     { echo "Error: IPNS over pubsub not enabled. Run your ipfs daemon with --enable-namesys-pubsub"; exit 1;}
+  if [[ -n "${expose_port}" ]]; then
+    if $(ipfs config --json Experimental.Libp2pStreamMounting); then
+      ipfs p2p listen --allow-custom-protocol /http /ip4/127.0.0.1/tcp/"${expose_port}" || exit 1
+      echo "Status: Exposed http server at localhost:${expose_port}"
+      base36_key="$(ipfs key list -l --ipns-base=base36 | grep 'self' | cut -d' ' -f1)"
+      echo -e "URL: https://ipfs-link.herokuapp.com/ipns/${base36_key}/*\n"
+    else
+      echo "Error: Libp2p streams not enabled. Tip: `ipfs config --json Experimental.Libp2pStreamMounting true`"
+      exit 1
+    fi
+  fi
 else
   echo "Error: Failed to launch IPFS daemon. Exiting..."; exit 1
 fi >&2
@@ -160,9 +185,10 @@ main(){
 
     until launch_aux_node; do
       echo -ne "$(timestamp): Failed to start aux node. Trying again in 2s...\r"
+      sleep 2
     done && echo -e "\n\n$(timestamp): Aux node resumed"
 
-    local cid="$(echo "${multiaddress}" | ipfs add --pin=false --inline --inline-limit=1000 -Q)"
+    local cid="$(ipfs add --pin=false --inline --inline-limit=1000 -Q <<< "${multiaddress}")"
     if [[ "${cid}" != "${last_cid}" ]]; then # No need to expire old IPNS records & create same but new ones unnecessarily
       ipfs name publish --ipns-base=b58mh -Q /ipfs/"${cid}" &>/dev/null
       ipfs dht get /ipns/"${main_node_ID}" > "${buffer}" && \
@@ -183,7 +209,8 @@ main(){
       echo "${records[@]}" | xargs -n1 -P2 ipfs dht put /ipns/"${main_node_ID}" # Use max 2 threads
     ) 3< "${aux_IPFS_PATH}"/config &>/dev/null
      
-    flock -F -n "${aux_IPFS_PATH}/config" ipfs -c "${aux_IPFS_PATH}" shutdown &>/dev/null
+    [[ "$("${BASH_SOURCE}" "${main_node_ID}")" == "${multiaddress}" ]] || continue # Continue if public gateway can't resolve
+    flock -n "${aux_IPFS_PATH}/config" ipfs -c "${aux_IPFS_PATH}" shutdown &>/dev/null
     echo -e "\n$(timestamp): Published multiaddress over IPNS. Aux node pausing for 15m..."; sleep 15m
   done
 } >&2; export -f main
