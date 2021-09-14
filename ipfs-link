@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Info: See `usage` funtion below
 
-export version=0.0.2 IPFS_PATH="${IPFS_PATH:="${HOME}"/.ipfs}"
+export version=0.0.3 IPFS_PATH="${IPFS_PATH:="${HOME}"/.ipfs}"
 
 usage(){
-  echo -e '\nBrief: Announce dynamic multiaddress of isolated or private node through IPNS or get multiaddress to such a node'
+  echo -e '\nBrief: 
+1. Publish dynamic multiaddress of isolated or private node using IPNS
+2. Get multiaddress to such a node'
   echo -e '\nUsage: ipfs-link [option] [<peerID>]
   Provide peerID only when seeking multiaddress (or swarm key) to the corresponding node'
   echo -e "\nOption: 
@@ -12,7 +14,7 @@ usage(){
     For swarm key generation.
     $(tput smul)hash$(tput rmul) implies key derived from peerID. $(tput smul)rand$(tput rmul) implies random key.
   -c IPFS_PATH
-    Pass path to local IPFS repository. Can also use IPFS_PATH env variable instead.
+    Provide the path to the local IPFS repository. Can also use IPFS_PATH env variable instead.
   -v
     Version
   -h
@@ -23,7 +25,15 @@ usage(){
 
 dep_check(){
   # Brief: Check major dependencies
-  local quit
+  local ipfs_version quit
+  if ipfs_version=$(ipfs version --number 2>/dev/null); then
+    local req_ipfs_ver=0.9.0 # Minimum ipfs-cli version required
+    [[ "$(echo -e "${ipfs_version}\n${req_ipfs_ver}" | sort -V | head -n1)" == "${req_ipfs_ver}" ]] || \
+      { echo -e "Required: go-ipfs-cli version >= ${req_ipfs_ver}\nSuggestion: ipfs update install latest\n"; quit="yes";}
+  else
+    echo -e "Required: go-ipfs-cli\nSource: https://docs.ipfs.io/install/command-line/#linux\n"
+    quit="yes"
+  fi
   if ! command -v jq &>/dev/null; then
     echo -e "Required: jq\nSource: Native package repository"
     echo -e "Ref: https://stedolan.github.io/jq/download/\n"
@@ -81,7 +91,7 @@ main_node_config(){
     local curr_bootstrap="$(ipfs bootstrap list)"
     local default_bootstrap="$(ipfs bootstrap rm all; ipfs bootstrap add default; ipfs bootstrap list)"
     local pnet_boostrap="$(echo "${curr_bootstrap}" | grep -vf <(echo "${default_bootstrap}"))"
-    ipfs bootstrap rm all; echo "${pnet_boostrap}" | ipfs bootstrap add
+    ipfs bootstrap rm all; ipfs bootstrap add <<< "${pnet_boostrap}"
   else
     ipfs bootstrap add default
     local daemon_opts=(--routing=none) # Don't touch the config file
@@ -91,7 +101,7 @@ main_node_config(){
 } &>/dev/null; export main_node_config
 
 export main_node_ID="$(ipfs id -f='<id>')"
-echo -e "Status: Getting node online...\nID: ${main_node_ID}\nRepo: ${IPFS_PATH}"
+echo -e "Status: Getting node online...\nID: ${main_node_ID}\nRepo: ${IPFS_PATH}" >&2
 if main_node_config; then
   echo -e "Status: Node is online"
   [[ -f "${IPFS_PATH}"/swarm.key ]] && echo -e "Swarm key file: ${IPFS_PATH}/swarm.key\n" || echo
@@ -160,6 +170,7 @@ main(){
 
     until launch_aux_node; do
       echo -ne "$(timestamp): Failed to start aux node. Trying again in 2s...\r"
+      sleep 2
     done && echo -e "\n\n$(timestamp): Aux node resumed"
 
     local cid="$(echo "${multiaddress}" | ipfs add --pin=false --inline --inline-limit=1000 -Q)"
@@ -183,7 +194,8 @@ main(){
       echo "${records[@]}" | xargs -n1 -P2 ipfs dht put /ipns/"${main_node_ID}" # Use max 2 threads
     ) 3< "${aux_IPFS_PATH}"/config &>/dev/null
      
-    flock -F -n "${aux_IPFS_PATH}/config" ipfs -c "${aux_IPFS_PATH}" shutdown &>/dev/null
+    flock -n "${aux_IPFS_PATH}/config" ipfs -c "${aux_IPFS_PATH}" shutdown &>/dev/null
+    [[ "$("${BASH_SOURCE}" "${main_node_ID}")" == "${multiaddress}" ]] || continue # Continue if public gateway can't resolve
     echo -e "\n$(timestamp): Published multiaddress over IPNS. Aux node pausing for 15m..."; sleep 15m
   done
 } >&2; export -f main
