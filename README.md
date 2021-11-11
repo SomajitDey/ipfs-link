@@ -5,6 +5,8 @@
 
 To understand the purposes of this tool better, see [Use cases](#use-cases).
 
+**This project matured into [IPNS-Link](https://github.com/ipns-link/specs). Check it out if you are into web-hosting.**
+
 #### Keywords
 
 ipfs ; ipns ; private-network ; bandwidth savings ; multiaddress ; swarm key ; dynamic IP address ; port-forwarding ; proxy ; reverse proxy ; pubsub ; DDNS ; p2p ; home server ; exposing localhost ; bootstrap node ;
@@ -104,6 +106,10 @@ ipfs-link [option] [<peerID>]
 ## Bug-reports and Feedbacks
 
 Post at [issues](https://github.com/SomajitDey/ipfs-link/issues) and [discussion](https://github.com/SomajitDey/ipfs-link/discussions), or [write to me](mailto://hereistitan@gmail.com).
+
+## See also
+
+[IPNS-Link](https://github.com/ipns-link/specs)
 
 ------
 
